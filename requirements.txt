@@ -1,0 +1,8 @@
+streamlit
+numpy
+pandas
+plotly
+akshare
+requests
+volcengine-python-sdk
+scipy
