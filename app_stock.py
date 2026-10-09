@@ -16,15 +16,20 @@ st.caption("自选股票 · 多指标评分 · AI舆情分析 · 人话解读")
 
 
 # ============================================================
-# 环境变量读取（部署时用）
+# 配置读取（优先环境变量，其次Secrets）
 # ============================================================
 def get_config(key, default=""):
-    """优先从环境变量读，读不到再用默认值"""
-    return os.environ.get(key, default)
+    val = os.environ.get(key, "")
+    if val:
+        return val
+    try:
+        return st.secrets.get(key, default)
+    except:
+        return default
 
 
 # ============================================================
-# 数据源 1：股价（akshare）
+# 股价数据
 # ============================================================
 @st.cache_data(ttl=3600)
 def get_stock_data_akshare(code, days=500):
@@ -85,14 +90,12 @@ def get_stock_data(code, days=500):
 
 
 # ============================================================
-# 新闻源
+# 新闻
 # ============================================================
 @st.cache_data(ttl=1800)
 def get_news_eastmoney(keyword):
     try:
-        import requests
-        import json
-        
+        import requests, json
         url = "https://search-api-web.eastmoney.com/search/jsonp"
         param_json = (
             '{"uid":"","keyword":"' + keyword + '",'
@@ -105,16 +108,13 @@ def get_news_eastmoney(keyword):
         )
         params = {"cb": "jQuery", "param": param_json, "_": "1700000000000"}
         headers = {"User-Agent": "Mozilla/5.0"}
-        
         response = requests.get(url, params=params, headers=headers, timeout=10)
         text = response.text
         json_str = text[text.index('(')+1:text.rindex(')')]
         data = json.loads(json_str)
-        
         articles = data.get('result', {}).get('cmsArticleWebOld', [])
         if not articles:
             return []
-        
         return [{
             '标题': a.get('title', '').replace('<em>', '').replace('</em>', ''),
             '摘要': a.get('content', '').replace('<em>', '').replace('</em>', '')[:300],
@@ -133,14 +133,11 @@ def get_news_sina(keyword):
         url = "https://feed.mix.sina.com.cn/api/roll/get"
         params = {"pageid": "153", "lid": "2516", "k": keyword, "num": "10", "page": "1"}
         headers = {"User-Agent": "Mozilla/5.0"}
-        
         response = requests.get(url, params=params, headers=headers, timeout=10)
         data = response.json()
-        
         items = data.get('result', {}).get('data', [])
         if not items:
             return []
-        
         return [{
             '标题': item.get('title', ''),
             '摘要': item.get('intro', '')[:300],
@@ -155,27 +152,22 @@ def get_news_sina(keyword):
 def get_news_multi(keyword, max_items=8):
     all_news = []
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [
-            executor.submit(get_news_eastmoney, keyword),
-            executor.submit(get_news_sina, keyword)
-        ]
+        futures = [executor.submit(get_news_eastmoney, keyword),
+                   executor.submit(get_news_sina, keyword)]
         for f in futures:
             try:
                 result = f.result(timeout=15)
                 all_news.extend(result)
             except:
                 pass
-    
     if not all_news:
         return None
-    
     seen = set()
     unique = []
     for n in all_news:
         if n['标题'] and n['标题'] not in seen:
             seen.add(n['标题'])
             unique.append(n)
-    
     return pd.DataFrame(unique[:max_items])
 
 
@@ -186,19 +178,15 @@ def get_news_multi(keyword, max_items=8):
 def analyze_news_batch_ai(titles_summaries, api_key, endpoint_id):
     if not titles_summaries:
         return []
-    
     try:
         from volcenginesdkarkruntime import Ark
-        
         client = Ark(
             base_url="https://ark.cn-beijing.volces.com/api/v3",
             api_key=api_key,
         )
-        
         news_text = ""
         for i, (title, summary) in enumerate(titles_summaries, 1):
             news_text += f"{i}. 标题：{title}\n摘要：{summary[:100]}\n\n"
-        
         prompt = f"""请分析以下{len(titles_summaries)}条A股财经新闻，逐条判断利好/利空/中性。
 
 {news_text}
@@ -207,24 +195,20 @@ def analyze_news_batch_ai(titles_summaries, api_key, endpoint_id):
 1. 利好 | 简短理由
 2. 利空 | 简短理由
 3. 中性 | 简短理由
-...
 
 要求：
 - 每条只输出一行
 - 序号从1开始，与上面新闻对应
 - 理由不超过15字
 - 只输出"利好"、"利空"或"中性"，不要其他词"""
-        
         response = client.chat.completions.create(
             model=endpoint_id,
             messages=[
                 {"role": "system", "content": "你是资深A股分析师，严格按用户要求的格式输出。"},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.1,
-            max_tokens=800,
+            temperature=0.1, max_tokens=800,
         )
-        
         result = response.choices[0].message.content.strip()
         lines = result.split('\n')
         parsed = {}
@@ -232,10 +216,7 @@ def analyze_news_batch_ai(titles_summaries, api_key, endpoint_id):
             match = re.match(r'^\s*(\d+)[.、]\s*(利好|利空|中性)\s*[|｜]\s*(.+)$', line.strip())
             if match:
                 idx = int(match.group(1))
-                sentiment = match.group(2)
-                reason = match.group(3).strip()
-                parsed[idx] = (sentiment, reason)
-        
+                parsed[idx] = (match.group(2), match.group(3).strip())
         results = []
         for i in range(1, len(titles_summaries) + 1):
             if i in parsed:
@@ -243,22 +224,19 @@ def analyze_news_batch_ai(titles_summaries, api_key, endpoint_id):
                 emoji = "🟢" if sentiment == "利好" else ("🔴" if sentiment == "利空" else "⚪")
                 results.append(f"{emoji} {sentiment} | {reason}")
             else:
-                title, summary = titles_summaries[i-1]
-                results.append(analyze_news_keyword(title, summary))
-        
+                t, s = titles_summaries[i-1]
+                results.append(analyze_news_keyword(t, s))
         return results
-    except Exception as e:
+    except:
         return [analyze_news_keyword(t, s) for t, s in titles_summaries]
 
 
 def analyze_news_keyword(title, summary):
     text = f"{title} {summary}"
-    positive_words = ['涨', '利好', '增长', '突破', '买入', '上调', '涨停', '新高', '盈利', '超预期', '大涨', '飙升']
-    negative_words = ['跌', '利空', '下滑', '跌破', '卖出', '下调', '跌停', '新低', '亏损', '不及预期', '大跌', '暴跌']
-    
-    pos = sum(1 for w in positive_words if w in text)
-    neg = sum(1 for w in negative_words if w in text)
-    
+    pos_words = ['涨', '利好', '增长', '突破', '买入', '上调', '涨停', '新高', '盈利', '超预期', '大涨', '飙升']
+    neg_words = ['跌', '利空', '下滑', '跌破', '卖出', '下调', '跌停', '新低', '亏损', '不及预期', '大跌', '暴跌']
+    pos = sum(1 for w in pos_words if w in text)
+    neg = sum(1 for w in neg_words if w in text)
     if pos > neg:
         return "🟢 利好 | 关键词匹配"
     elif neg > pos:
@@ -268,58 +246,10 @@ def analyze_news_keyword(title, summary):
 
 
 # ============================================================
-# AI 生成综合建议
-# ============================================================
-@st.cache_data(ttl=3600, show_spinner=False)
-def generate_advice_ai(score, trend, risk, rsi, news_summary, api_key, endpoint_id):
-    try:
-        from volcenginesdkarkruntime import Ark
-        
-        client = Ark(
-            base_url="https://ark.cn-beijing.volces.com/api/v3",
-            api_key=api_key,
-        )
-        
-        prompt = f"""基于以下信息，用一句话（不超过30字）给出投资建议：
-
-- 综合评分：{score}/100
-- 趋势：{trend}
-- 风险：{risk}
-- RSI：{rsi:.1f}
-- 新闻情绪：{news_summary}
-
-只输出一句话建议，不要解释，不要分点。"""
-        
-        response = client.chat.completions.create(
-            model=endpoint_id,
-            messages=[
-                {"role": "system", "content": "你是资深A股分析师，回答简洁专业。"},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=80,
-        )
-        
-        return response.choices[0].message.content.strip()
-    except:
-        return generate_advice_rule(score, trend, risk)
-
-
-def generate_advice_rule(score, trend, risk):
-    if score >= 70:
-        return "可以考虑关注，仓位建议不超过总资产的30%"
-    elif score >= 50:
-        return "建议观望，等待更明确的信号"
-    else:
-        return "建议谨慎，短期风险较大"
-
-
-# ============================================================
 # 技术指标
 # ============================================================
 def calc_indicators(df):
     close = df['close']
-    
     ma5 = close.rolling(5).mean().iloc[-1]
     ma20 = close.rolling(20).mean().iloc[-1]
     ma60 = close.rolling(60).mean().iloc[-1]
@@ -364,22 +294,18 @@ def calc_indicators(df):
     
     return {
         "current": float(current),
-        "trend": trend,
-        "trend_score": trend_score,
-        "volatility": float(volatility),
-        "risk": risk,
-        "risk_score": risk_score,
-        "rsi": float(rsi),
-        "rsi_signal": rsi_signal,
-        "change_1d": float(change_1d),
-        "change_3d": float(change_3d),
-        "change_5d": float(change_5d),
-        "change_20d": float(change_20d),
+        "ma5": float(ma5), "ma20": float(ma20), "ma60": float(ma60),
+        "trend": trend, "trend_score": trend_score,
+        "volatility": float(volatility), "risk": risk, "risk_score": risk_score,
+        "rsi": float(rsi), "rsi_signal": rsi_signal,
+        "change_1d": float(change_1d), "change_3d": float(change_3d),
+        "change_5d": float(change_5d), "change_20d": float(change_20d),
         "close_series": close
     }
 
 
-def calc_total_score(ind):
+def calc_tech_score(ind):
+    """纯技术面评分（0-100）"""
     rsi = ind["rsi"]
     if 40 <= rsi <= 60:
         rsi_score = 80
@@ -387,15 +313,113 @@ def calc_total_score(ind):
         rsi_score = 60
     else:
         rsi_score = 30
+    return int(ind["trend_score"] * 0.4 + ind["risk_score"] * 0.3 + rsi_score * 0.3)
+
+
+def calc_news_score(sentiments):
+    """新闻情绪评分（0-100）"""
+    if not sentiments:
+        return 50
+    total = len(sentiments)
+    pos = sum(1 for s in sentiments if "🟢" in s)
+    neg = sum(1 for s in sentiments if "🔴" in s)
+    # 利好比例映射到0-100
+    return int(50 + (pos - neg) / total * 50)
+
+
+def calc_total_score(tech_score, news_score):
+    """综合评分：技术85% + 新闻15%"""
+    return int(tech_score * 0.85 + news_score * 0.15)
+
+
+# ============================================================
+# 生成综合建议（具体版）
+# ============================================================
+def generate_detailed_advice(r, ind, sentiments, news_summary):
+    """生成详细的综合建议（规则版，稳定输出）"""
+    tech_score = r["tech_score"]
+    news_score = r["news_score"]
+    total = r["score"]
     
-    total = ind["trend_score"] * 0.4 + ind["risk_score"] * 0.3 + rsi_score * 0.3
-    return int(total)
+    # 判断技术面和消息面方向
+    tech_direction = "偏多" if tech_score >= 60 else ("偏空" if tech_score <= 40 else "中性")
+    news_direction = "偏多" if news_score >= 60 else ("偏空" if news_score <= 40 else "中性")
+    
+    # 分歧判断
+    has_divergence = (
+        (tech_score >= 60 and news_score <= 40) or
+        (tech_score <= 40 and news_score >= 60)
+    )
+    
+    lines = []
+    
+    # 分歧提示
+    if has_divergence:
+        lines.append(f"⚠️ **技术面与消息面存在分歧**")
+        lines.append(f"- 📉 技术面：{ind['trend']}，RSI {ind['rsi']:.1f}（{ind['rsi_signal']}）")
+        lines.append(f"- 📰 消息面：{news_summary}")
+        lines.append("")
+        lines.append("**可能原因**：市场对消息的反应滞后，或存在其他利空因素未反映在新闻中。")
+    else:
+        lines.append(f"✅ **技术面与消息面方向一致**")
+        lines.append(f"- 📊 技术面：{ind['trend']}，RSI {ind['rsi']:.1f}（{ind['rsi_signal']}）")
+        lines.append(f"- 📰 消息面：{news_summary}")
+    
+    lines.append("")
+    lines.append("**🎯 操作建议**")
+    
+    # 根据技术面+消息面给出操作建议
+    if tech_direction == "偏多" and news_direction == "偏多":
+        lines.append("- 可考虑建仓，仓位建议不超过总资产的30%")
+        lines.append("- 回踩MA20可加仓")
+        lines.append(f"- 目标位：前期高点附近")
+        lines.append("- 止损位：跌破MA20")
+        
+    elif tech_direction == "偏空" and news_direction == "偏空":
+        lines.append("- 建议观望或减持，避免抄底")
+        lines.append("- 等待技术面企稳（如站上MA20）再考虑")
+        lines.append("- 如已持仓，设置止损位")
+        
+    elif tech_direction == "偏多" and news_direction == "偏空":
+        lines.append("- 技术面尚可，但消息面不利，谨慎持有")
+        lines.append("- 仓位建议不超过10%")
+        lines.append("- 关注消息面是否有进一步恶化")
+        lines.append("- 如跌破MA20，果断减仓")
+        
+    elif tech_direction == "偏空" and news_direction == "偏多":
+        lines.append("- 技术面偏弱，但消息面利好，存在反转可能")
+        lines.append("- 暂时观望，等待K线企稳信号")
+        lines.append("- 如果放量突破MA20，可小仓位试仓（不超过10%）")
+        lines.append("- 如果继续跌破前期低点，果断放弃")
+        
+    else:
+        lines.append("- 多空信号不明确，建议观望")
+        lines.append("- 等待更明确的信号后再操作")
+    
+    lines.append("")
+    lines.append("**🛡️ 风险提示**")
+    
+    if ind["rsi"] > 70:
+        lines.append("- ⚠️ RSI超买，短期可能回调")
+    elif ind["rsi"] < 30:
+        lines.append("- 💡 RSI超卖，可能有反弹机会")
+    
+    if ind["volatility"] > 0.35:
+        lines.append("- ⚠️ 波动率较高，注意仓位控制")
+    
+    if has_divergence:
+        lines.append("- ⚠️ 技术面与消息面分歧，需谨慎判断")
+    
+    if tech_direction == "偏空":
+        lines.append("- 📉 短期趋势向下，不宜重仓")
+    
+    return "\n".join(lines)
 
 
 # ============================================================
-# 核心：分析所有股票
+# 分析所有股票
 # ============================================================
-def analyze_all_stocks(watchlist):
+def analyze_all_stocks(watchlist, api_key, endpoint_id, use_ai):
     results = []
     progress = st.progress(0, text="正在分析股票...")
     
@@ -405,11 +429,32 @@ def analyze_all_stocks(watchlist):
         data = get_stock_data(code)
         if data["success"]:
             ind = calc_indicators(data["df"])
-            score = calc_total_score(ind)
+            tech_score = calc_tech_score(ind)
+            
+            # 抓新闻
+            name = data["info"].get("股票简称", code)
+            search_name = name if name != code else code
+            news = get_news_multi(search_name, max_items=8)
+            
+            sentiments = []
+            news_summary = "无新闻"
+            if news is not None and len(news) > 0:
+                pairs = list(zip(news['标题'].tolist(), news['摘要'].tolist()))
+                if use_ai and api_key and endpoint_id:
+                    sentiments = analyze_news_batch_ai(pairs, api_key, endpoint_id)
+                else:
+                    sentiments = [analyze_news_keyword(t, s) for t, s in pairs]
+                
+                pos = sum(1 for s in sentiments if "🟢" in s)
+                neg = sum(1 for s in sentiments if "🔴" in s)
+                news_summary = f"{pos}条利好、{neg}条利空，共{len(sentiments)}条"
+            
+            news_score = calc_news_score(sentiments)
+            total_score = calc_total_score(tech_score, news_score)
             
             results.append({
                 "code": code,
-                "name": data["info"].get("股票简称", code),
+                "name": name,
                 "price": ind["current"],
                 "change_1d": ind["change_1d"],
                 "change_3d": ind["change_3d"],
@@ -418,26 +463,24 @@ def analyze_all_stocks(watchlist):
                 "trend": ind["trend"],
                 "risk": ind["risk"],
                 "rsi": ind["rsi"],
-                "score": score,
+                "tech_score": tech_score,
+                "news_score": news_score,
+                "score": total_score,
                 "indicators": ind,
+                "news": news,
+                "sentiments": sentiments,
+                "news_summary": news_summary,
                 "source": data.get("source", "unknown")
             })
         else:
             results.append({
-                "code": code,
-                "name": f"{code} (数据获取失败)",
-                "price": 0,
-                "change_1d": 0,
-                "change_3d": 0,
-                "change_5d": 0,
-                "change_20d": 0,
-                "trend": "未知",
-                "risk": "未知",
-                "rsi": 0,
-                "score": 0,
-                "indicators": None,
-                "source": "none",
-                "error": data.get("error", "未知错误")
+                "code": code, "name": f"{code} (数据失败)",
+                "price": 0, "change_1d": 0, "change_3d": 0,
+                "change_5d": 0, "change_20d": 0,
+                "trend": "未知", "risk": "未知", "rsi": 0,
+                "tech_score": 0, "news_score": 0, "score": 0,
+                "indicators": None, "error": data.get("error", "未知"),
+                "source": "none"
             })
     
     progress.empty()
@@ -456,11 +499,10 @@ with st.sidebar:
     new_code = st.text_input("添加股票代码", placeholder="如：600519")
     if st.button("➕ 添加") and new_code:
         new_code = new_code.strip()
-        # 校验：必须是6位数字
         if not (len(new_code) == 6 and new_code.isdigit()):
-            st.error("❌ 股票代码必须是6位数字（如：600519）")
+            st.error("❌ 股票代码必须是6位数字")
         elif new_code in st.session_state.watchlist:
-            st.warning("⚠️ 该股票已在自选中")
+            st.warning("⚠️ 已在自选中")
         else:
             st.session_state.watchlist.append(new_code)
             if "stock_results" in st.session_state:
@@ -481,7 +523,6 @@ with st.sidebar:
     st.divider()
     st.subheader("🤖 AI 设置")
     
-    # 优先从环境变量读，读不到才让用户填
     default_key = get_config("ARK_API_KEY", "")
     default_endpoint = get_config("ENDPOINT_ID", "")
     
@@ -493,8 +534,7 @@ with st.sidebar:
     else:
         api_key = st.text_input("火山引擎 API Key", type="password")
         endpoint_id = st.text_input("接入点 ID", placeholder="ep-xxxxxxxx")
-        use_ai = st.checkbox("使用 AI 分析", value=False,
-                             help="批量分析新闻 + AI生成建议")
+        use_ai = st.checkbox("使用 AI 分析", value=False)
 
 
 # ============================================================
@@ -508,18 +548,18 @@ if st.button("🔄 刷新所有股票", type="primary"):
     st.rerun()
 
 if "stock_results" not in st.session_state:
-    st.session_state.stock_results = analyze_all_stocks(st.session_state.watchlist)
+    st.session_state.stock_results = analyze_all_stocks(
+        st.session_state.watchlist, api_key, endpoint_id, use_ai
+    )
 
 
 # ============================================================
 # 显示结果
 # ============================================================
 if "stock_results" in st.session_state:
-    results = st.session_state.stock_results
-    
-    for r in results:
+    for r in st.session_state.stock_results:
         if r.get("error") or r["price"] == 0:
-            st.error(f"❌ {r['code']} 数据获取失败：{r.get('error', '未知错误')}")
+            st.error(f"❌ {r['code']} 数据获取失败：{r.get('error', '未知')}")
             st.divider()
             continue
         
@@ -547,107 +587,69 @@ if "stock_results" in st.session_state:
         with st.expander(f"📖 {r['name']} 详细分析"):
             ind = r["indicators"]
             
+            # K线
             st.markdown("**📈 近60日走势**")
             close_recent = ind["close_series"].tail(60)
             ma20_recent = ind["close_series"].rolling(20).mean().tail(60)
             
             fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=close_recent.index, y=close_recent.values,
-                mode='lines', name='收盘价', line=dict(color='blue', width=2)
-            ))
-            fig.add_trace(go.Scatter(
-                x=ma20_recent.index, y=ma20_recent.values,
-                mode='lines', name='MA20', line=dict(color='orange', width=1)
-            ))
-            fig.update_layout(height=300, margin=dict(l=0, r=0, t=0, b=0),
-                              hovermode='x unified')
+            fig.add_trace(go.Scatter(x=close_recent.index, y=close_recent.values,
+                                     mode='lines', name='收盘价', line=dict(color='blue', width=2)))
+            fig.add_trace(go.Scatter(x=ma20_recent.index, y=ma20_recent.values,
+                                     mode='lines', name='MA20', line=dict(color='orange', width=1)))
+            fig.update_layout(height=300, margin=dict(l=0, r=0, t=0, b=0), hovermode='x unified')
             st.plotly_chart(fig, use_container_width=True)
             
+            # 指标
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("趋势", ind["trend"])
             c2.metric("风险", ind["risk"])
             c3.metric("RSI", f"{ind['rsi']:.1f} ({ind['rsi_signal']})")
             c4.metric("波动率", f"{ind['volatility']*100:.1f}%")
             
+            # 评分拆解
+            st.markdown("**📊 评分拆解**")
+            col_s1, col_s2, col_s3 = st.columns(3)
+            col_s1.metric("技术面", f"{r['tech_score']}分", help="85%权重")
+            col_s2.metric("消息面", f"{r['news_score']}分", help="15%权重")
+            col_s3.metric("综合", f"{r['score']}分")
+            
+            # 人话解读
             st.markdown("**💡 人话解读**")
             if ind["trend_score"] >= 70:
-                st.success(f"📈 趋势：{ind['trend']}，近期走势良好")
+                st.success(f"📈 趋势：{ind['trend']}")
             elif ind["trend_score"] >= 50:
-                st.warning(f"➡️ 趋势：{ind['trend']}，方向不明朗")
+                st.warning(f"➡️ 趋势：{ind['trend']}")
             else:
-                st.error(f"📉 趋势：{ind['trend']}，短期承压")
-            
-            if ind["risk_score"] >= 70:
-                st.success(f"🛡️ 风险：{ind['risk']}，波动较小")
-            elif ind["risk_score"] >= 50:
-                st.warning(f"⚠️ 风险：{ind['risk']}，注意波动")
-            else:
-                st.error(f"🔥 风险：{ind['risk']}，波动剧烈")
-            
-            if ind["rsi_signal"] == "超卖":
-                st.info(f"💡 RSI：{ind['rsi']:.1f}，超卖，可能有反弹机会")
-            elif ind["rsi_signal"] == "超买":
-                st.info(f"💡 RSI：{ind['rsi']:.1f}，超买，注意回调风险")
-            else:
-                st.info(f"💡 RSI：{ind['rsi']:.1f}，正常区间")
+                st.error(f"📉 趋势：{ind['trend']}")
             
             # 新闻
             st.markdown("**📰 相关新闻（多源）**")
-            search_name = r['name'] if r['name'] != r['code'] else r['code']
-            news = get_news_multi(search_name, max_items=8)
+            news = r.get("news")
+            sentiments = r.get("sentiments", [])
             
-            news_summary = "无"
-            sentiments = []
-            
-            if news is not None and len(news) > 0:
-                pairs = list(zip(news['标题'].tolist(), news['摘要'].tolist()))
-                
-                if use_ai and api_key and endpoint_id:
-                    sentiments = analyze_news_batch_ai(pairs, api_key, endpoint_id)
-                else:
-                    sentiments = [analyze_news_keyword(t, s) for t, s in pairs]
-                
-                pos_count = sum(1 for s in sentiments if "🟢" in s)
-                neg_count = sum(1 for s in sentiments if "🔴" in s)
-                total = len(sentiments)
-                
-                news_summary = f"{pos_count}条利好、{neg_count}条利空，共{total}条"
+            if news is not None and len(news) > 0 and sentiments:
+                pos = sum(1 for s in sentiments if "🟢" in s)
+                neg = sum(1 for s in sentiments if "🔴" in s)
                 
                 col_n1, col_n2, col_n3 = st.columns(3)
-                col_n1.metric("利好新闻", pos_count)
-                col_n2.metric("利空新闻", neg_count)
+                col_n1.metric("利好新闻", pos)
+                col_n2.metric("利空新闻", neg)
                 col_n3.metric("情绪倾向",
-                              "偏多" if pos_count > neg_count else ("偏空" if neg_count > pos_count else "中性"))
+                              "偏多" if pos > neg else ("偏空" if neg > pos else "中性"))
                 
                 for (_, row), sentiment in zip(news.iterrows(), sentiments):
-                    title = row['标题']
-                    url = row['链接']
-                    source = row['来源']
-                    if url:
-                        st.markdown(f"- {sentiment}｜[{title}]({url}) `{source}`")
+                    if row['链接']:
+                        st.markdown(f"- {sentiment}｜[{row['标题']}]({row['链接']}) `{row['来源']}`")
                     else:
-                        st.markdown(f"- {sentiment}｜{title} `{source}`")
+                        st.markdown(f"- {sentiment}｜{row['标题']} `{row['来源']}`")
             else:
-                st.caption(f"暂无「{search_name}」相关新闻")
+                st.caption("暂无相关新闻")
             
-            # AI 生成建议
+            # 综合建议（详细版）
             st.markdown("**🎯 综合建议**")
-            if use_ai and api_key and endpoint_id:
-                advice = generate_advice_ai(
-                    r["score"], ind["trend"], ind["risk"],
-                    ind["rsi"], news_summary,
-                    api_key, endpoint_id
-                )
-            else:
-                advice = generate_advice_rule(r["score"], ind["trend"], ind["risk"])
-            
-            if r["score"] >= 70:
-                st.success(f"💡 {advice}")
-            elif r["score"] >= 50:
-                st.warning(f"💡 {advice}")
-            else:
-                st.error(f"💡 {advice}")
+            advice = generate_detailed_advice(r, ind, sentiments, r.get("news_summary", "无"))
+            st.markdown(advice)
         
         st.divider()
 
